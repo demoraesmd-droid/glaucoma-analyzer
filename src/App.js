@@ -1201,37 +1201,25 @@ const MDSlopeChart = ({ tests }) => {
   const { slope, intercept, r2, pValue, ciLower, ciUpper } = reg;
   const baseDate = new Date(sorted[0].date);
   
-  // Create data points for MD values and straight trend line
-  const chartData = sorted.map(t => {
+  // Calculate years for each test
+  const lastYears = (new Date(sorted[sorted.length - 1].date) - baseDate) / 31536000000;
+  const projectionYears = lastYears + 2;
+  
+  // Create data points with MD values
+  // Trend = best fit line value at each time point (y = intercept + slope * x)
+  const chartData = sorted.map((t, idx) => {
     const years = (new Date(t.date) - baseDate) / 31536000000;
     return {
       date: t.date,
       label: new Date(t.date).toLocaleDateString('en', { month: 'short', year: '2-digit' }),
       md: t.md,
       years,
+      trend: intercept + slope * years, // Best fit value at this time point
     };
   });
   
-  // Calculate trend line endpoints (straight line)
-  const firstYears = 0;
-  const lastYears = (new Date(sorted[sorted.length - 1].date) - baseDate) / 31536000000;
-  const projectionYears = lastYears + 2; // Project 2 years ahead
-  
-  // Add trend line points (just start and end for straight line)
-  const trendData = [
-    { years: firstYears, trend: intercept + slope * firstYears, label: chartData[0].label },
-    { years: lastYears, trend: intercept + slope * lastYears, label: chartData[chartData.length - 1].label },
-    { years: projectionYears, trend: intercept + slope * projectionYears, label: '+2yr', isProjection: true },
-  ];
-  
-  // Merge MD data with trend line
-  const combinedData = chartData.map(d => ({
-    ...d,
-    trend: intercept + slope * d.years,
-  }));
-  
   // Add projection point
-  combinedData.push({
+  chartData.push({
     label: '+2yr',
     md: null,
     trend: intercept + slope * projectionYears,
@@ -1258,14 +1246,14 @@ const MDSlopeChart = ({ tests }) => {
       
       <div style={{ height: 180 }}>
         <ResponsiveContainer>
-          <ComposedChart data={combinedData} margin={{ top: 10, right: 10, left: -15, bottom: 0 }}>
+          <ComposedChart data={chartData} margin={{ top: 10, right: 10, left: -15, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
             <XAxis dataKey="label" tick={{ fill: '#94a3b8', fontSize: 10 }} axisLine={{ stroke: '#475569' }} />
             <YAxis tick={{ fill: '#94a3b8', fontSize: 10 }} axisLine={{ stroke: '#475569' }} />
             <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid #334155', borderRadius: 8, fontSize: 12 }} />
             <ReferenceLine y={0} stroke="#475569" strokeDasharray="3 3" />
-            <Line type="linear" dataKey="trend" stroke={isProgressing ? '#ef4444' : '#06b6d4'} strokeWidth={2} dot={false} />
-            <Line type="monotone" dataKey="md" stroke="#22d3ee" strokeWidth={2} dot={{ fill: '#22d3ee', r: 4, stroke: '#0f172a', strokeWidth: 2 }} connectNulls={false} />
+            <Line type="linear" dataKey="trend" stroke={isProgressing ? '#ef4444' : '#06b6d4'} strokeWidth={2} dot={false} name="Best Fit" />
+            <Line type="linear" dataKey="md" stroke="#22d3ee" strokeWidth={0} dot={{ fill: '#22d3ee', r: 4, stroke: '#0f172a', strokeWidth: 2 }} connectNulls={false} name="MD" />
           </ComposedChart>
         </ResponsiveContainer>
       </div>
