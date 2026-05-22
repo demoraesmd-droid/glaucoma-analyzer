@@ -129,7 +129,7 @@ const getGPAThreshold = (td, pattern = '24-2', md = 0) => {
 };
 
 // PLR thresholds
-const PLR_THRESHOLDS = { pValueCutoff: 0.01 }; // Flag points with slope < 0 at P < 0.01
+const PLR_THRESHOLDS = { pValueCutoff: 0.05 }; // Flag points with slope < 0 at P < 0.05
 
 // Blind spot locations
 const BLIND_SPOT = { OD: { x: 15, y: -3 }, OS: { x: -15, y: -3 } };
@@ -843,169 +843,6 @@ const fastestDecliningAnalysis = tests => {
   };
 };
 
-// PoPLR Analysis (Permutation of Pointwise Linear Regression)
-// Reference: O'Leary et al. "Asymmetric progression of visual field defects in glaucoma"
-// 
-// METHODOLOGY:
-// 1. For each test location, fit linear regression of TD vs time
-// 2. For locations with NEGATIVE slopes (worsening), record the p-value
-// 3. Calculate S-statistic = Σ(-log10(p)) for all negative-slope locations
-//    - Higher S means more/stronger declining locations
-// 4. Permutation test: Shuffle temporal order of tests 5000 times
-//    - For each permutation, recalculate slopes and S-statistic
-//    - This breaks the temporal structure (null hypothesis: no progression)
-// 5. Global p-value = proportion of permuted S >= observed S
-//    - If observed S is rarely exceeded by chance, progression is significant
-//
-// INTERPRETATION:
-// - p < 0.01: Likely progression
-// - p < 0.05: Possible progression
-// - p >= 0.05: Stable (no significant progression detected)
-const poplrAnalysis = tests => {
-  if (tests.length < 4 || !tests[0].td?.length) {
-    return { 
-      status: 'insufficient', 
-      sStatistic: null, 
-      pValue: null, 
-      progressing: false,
-      numPermutations: 0,
-      pointsUsed: 0,
-      pattern: '24-2'
-    };
-  }
-  
-  const sorted = [...tests].sort((a, b) => new Date(a.date) - new Date(b.date));
-  const baseDate = new Date(sorted[0].date);
-  const years = sorted.map(t => (new Date(t.date) - baseDate) / 31536000000);
-  const n = sorted.length;
-  
-  // Detect pattern from first test
-  const pattern = sorted[0].pattern || '24-2';
-  const gridSize = getVFGridSize(pattern);
-  
-  // Step 1: Calculate observed slopes and p-values for each location
-  const locationData = [];
-  
-  for (let i = 0; i < gridSize; i++) {
-    const tdValues = sorted.map(t => t.td?.[i]?.td).filter(v => v != null);
-    if (tdValues.length < 4) continue;
-    
-    const validYears = years.slice(0, tdValues.length);
-    const reg = linearRegression(validYears, tdValues);
-    if (!reg) continue;
-    
-    // Only include locations with negative slopes (potential progression)
-    if (reg.slope < 0) {
-      locationData.push({
-        index: i,
-        tdValues: tdValues,
-        years: validYears,
-        slope: reg.slope,
-        pValue: reg.pValue
-      });
-    }
-  }
-  
-  if (locationData.length === 0) {
-    return { 
-      status: 'stable', 
-      sStatistic: 0, 
-      pValue: 1, 
-      progressing: false,
-      numPermutations: 0,
-      pointsUsed: 0,
-      pattern
-    };
-  }
-  
-  // Step 2: Calculate S-statistic (sum of -log10(p) for negative slopes)
-  // Truncate p-values at 0.0001 to avoid log(0)
-  const calcSStatistic = (pValues) => {
-    return pValues.reduce((sum, p) => {
-      const truncP = Math.max(p, 0.0001);
-      return sum + (-Math.log10(truncP));
-    }, 0);
-  };
-  
-  const observedS = calcSStatistic(locationData.map(d => d.pValue));
-  
-  // Step 3: Permutation test
-  // Shuffle the temporal order of tests and recalculate S-statistic
-  const numPermutations = 5000;
-  let countGreaterOrEqual = 0;
-  
-  // Fisher-Yates shuffle helper
-  const shuffle = (array) => {
-    const arr = [...array];
-    for (let i = arr.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [arr[i], arr[j]] = [arr[j], arr[i]];
-    }
-    return arr;
-  };
-  
-  for (let perm = 0; perm < numPermutations; perm++) {
-    // Create shuffled time indices
-    const shuffledIndices = shuffle([...Array(n).keys()]);
-    const shuffledYears = shuffledIndices.map(i => years[i]);
-    
-    // Recalculate slopes and p-values for each location with shuffled times
-    const permPValues = [];
-    
-    for (const loc of locationData) {
-      // Reorder TD values according to shuffled indices
-      const shuffledTD = shuffledIndices.map(i => {
-        const test = sorted[i];
-        return test.td?.[loc.index]?.td;
-      }).filter(v => v != null);
-      
-      if (shuffledTD.length < 4) continue;
-      
-      const reg = linearRegression(shuffledYears.slice(0, shuffledTD.length), shuffledTD);
-      if (reg && reg.slope < 0) {
-        permPValues.push(reg.pValue);
-      }
-    }
-    
-    if (permPValues.length > 0) {
-      const permS = calcSStatistic(permPValues);
-      if (permS >= observedS) {
-        countGreaterOrEqual++;
-      }
-    }
-  }
-  
-  // Step 4: Calculate global p-value
-  const globalPValue = (countGreaterOrEqual + 1) / (numPermutations + 1);
-  
-  // Determine progression status
-  let status = 'stable';
-  let progressing = false;
-  
-  if (globalPValue < 0.01) {
-    status = 'likely';
-    progressing = true;
-  } else if (globalPValue < 0.05) {
-    status = 'possible';
-    progressing = true;
-  }
-  
-  // Count points that are statistically significant (slope < 0 AND p < 0.01)
-  const significantPoints = locationData.filter(l => l.slope < 0 && l.pValue < 0.01).length;
-  
-  return {
-    status,
-    sStatistic: observedS,
-    pValue: globalPValue,
-    progressing,
-    numPermutations,
-    pointsUsed: locationData.length, // All declining locations (used for S-stat)
-    significantPoints, // Only statistically significant (p < 0.01)
-    locationData, // Include for detailed analysis
-    pattern
-  };
-};
-
 // OCT Analysis
 const octAnalysis = scans => {
   if (scans.length < 2) return { status: 'insufficient' };
@@ -1031,9 +868,8 @@ const Icon = ({ d }) => (
 );
 
 // VF Grid Component - handles both 24-2 and 10-2
-const VFGrid = ({ gpa, plr, poplr, mode, eye = 'OD' }) => {
-  // For PoPLR, use the PLR points but color by PoPLR declining locations
-  const data = mode === 'poplr' ? plr.points : mode === 'plr' ? plr.points : gpa.bl;
+const VFGrid = ({ gpa, plr, mode, eye = 'OD' }) => {
+  const data = mode === 'plr' ? plr.points : gpa.bl;
   if (!data?.length) return null;
   
   // Detect pattern from analysis results
@@ -1056,30 +892,9 @@ const VFGrid = ({ gpa, plr, poplr, mode, eye = 'OD' }) => {
   // Point radius - smaller for 10-2 since points are denser
   const pointRadius = is10_2 ? 6 : 4;
   
-  // For PoPLR, get the declining location indices that are STATISTICALLY SIGNIFICANT
-  // Only flag points with slope < 0 AND p < 0.01 (matching PLR criteria)
-  const poplrSignificant = new Set(
-    (poplr?.locationData || [])
-      .filter(l => l.slope < 0 && l.pValue < 0.01)
-      .map(l => l.index)
-  );
-  
   const getColor = (p, idx) => {
-    if (mode === 'poplr') {
-      // Only color points that are statistically significant (slope < 0 AND p < 0.01)
-      if (poplrSignificant.has(idx)) {
-        const loc = poplr.locationData?.find(l => l.index === idx);
-        if (loc) {
-          if (loc.slope <= -1.5) return '#EF4444'; // Fast decline
-          if (loc.slope <= -1.0) return '#F97316'; // Moderate decline
-          return '#FBBF24'; // Slower but significant decline
-        }
-        return '#EF4444';
-      }
-      return '#10B981'; // Not significant
-    }
     if (mode === 'plr') {
-      if (p.status === 'significant') return '#EF4444'; // Slope < 0 and P < 0.01
+      if (p.status === 'significant') return '#EF4444'; // Slope < 0 and P < 0.05
       if (p.status === 'improving') return '#3B82F6';
       return '#10B981'; // Stable
     }
@@ -1094,29 +909,17 @@ const VFGrid = ({ gpa, plr, poplr, mode, eye = 'OD' }) => {
   };
   
   const getStroke = (p, idx) => {
-    if (mode === 'poplr') {
-      return poplrSignificant.has(idx) ? '#fff' : 'none';
-    }
     if (mode === 'plr') return p.status === 'significant' ? '#fff' : 'none';
     return gpa.prog.some(x => x.id === p.id) ? '#fff' : gpa.poss.some(x => x.id === p.id) ? '#fbbf24' : 'none';
   };
   
   const getTitle = (p, idx) => {
-    if (mode === 'poplr') {
-      const loc = poplr?.locationData?.find(l => l.index === idx);
-      if (loc) {
-        const isSignificant = loc.slope < 0 && loc.pValue < 0.01;
-        return `(${p.x}°, ${p.y}°)\nSlope: ${loc.slope.toFixed(2)} dB/yr\np=${loc.pValue < 0.001 ? '<0.001' : loc.pValue.toFixed(3)}${isSignificant ? '\n⚠️ Significant (p<0.01)' : ''}`;
-      }
-      return `(${p.x}°, ${p.y}°)\nStable/Improving`;
-    }
     if (mode === 'plr') {
-      return `(${p.x}°, ${p.y}°)\nSlope: ${p.slope?.toFixed(2)} dB/yr\np=${p.pValue?.toFixed(3)}`;
+      return `(${p.x}°, ${p.y}°)\nSlope: ${p.slope?.toFixed(2)} dB/yr\np=${p.pValue < 0.001 ? '<0.001' : p.pValue?.toFixed(3)}`;
     }
     return `(${p.x}°, ${p.y}°)\nTD: ${p.td?.toFixed(1)} dB`;
   };
   
-  // Degree markers based on pattern
   // Degree markers based on pattern - show at key positions
   const degreeMarkers = is10_2 ? [-9, -5, 5, 9] : [-20, -10, 10, 20];
   
@@ -1125,7 +928,7 @@ const VFGrid = ({ gpa, plr, poplr, mode, eye = 'OD' }) => {
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
         <span style={{ fontSize: 13, fontWeight: 500 }}>{pattern} Visual Field ({eye})</span>
         <span style={{ fontSize: 11, color: '#64748b' }}>
-          {mode === 'poplr' ? 'PoPLR Significant (p<0.01)' : mode === 'plr' ? 'PLR Slopes' : 'GPA Events'}
+          {mode === 'plr' ? 'PLR Slopes' : 'GPA Events'}
         </span>
       </div>
       
@@ -1174,19 +977,11 @@ const VFGrid = ({ gpa, plr, poplr, mode, eye = 'OD' }) => {
       
       {/* Legend */}
       <div style={{ display: 'flex', justifyContent: 'center', gap: 12, marginTop: 12, fontSize: 10 }}>
-        {mode === 'poplr' ? (
+        {mode === 'plr' ? (
           <>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><span style={{ width: 8, height: 8, borderRadius: '50%', background: '#EF4444', border: '1px solid #fff' }} />Fast</span>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><span style={{ width: 8, height: 8, borderRadius: '50%', background: '#F97316' }} />Mod</span>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><span style={{ width: 8, height: 8, borderRadius: '50%', background: '#FBBF24' }} />Slow</span>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><span style={{ width: 8, height: 8, borderRadius: '50%', background: '#EF4444', border: '1px solid #fff' }} />Progressing</span>
             <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><span style={{ width: 8, height: 8, borderRadius: '50%', background: '#10B981' }} />Stable</span>
-          </>
-        ) : mode === 'plr' ? (
-          <>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><span style={{ width: 8, height: 8, borderRadius: '50%', background: '#EF4444', border: '1px solid #fff' }} />Sig</span>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><span style={{ width: 8, height: 8, borderRadius: '50%', background: '#F59E0B' }} />Border</span>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><span style={{ width: 8, height: 8, borderRadius: '50%', background: '#10B981' }} />Stable</span>
-            <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><span style={{ width: 8, height: 8, borderRadius: '50%', background: '#3B82F6' }} />Improv</span>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}><span style={{ width: 8, height: 8, borderRadius: '50%', background: '#3B82F6' }} />Improving</span>
           </>
         ) : (
           <>
@@ -1458,7 +1253,7 @@ export default function App() {
   // Analysis
   const gpa = gpaAnalysis(sortedVf);
   const plr = plrAnalysis(sortedVf);
-  const poplr = poplrAnalysis(sortedVf);
+  // Analysis - GPA and PLR only
   const fastestDecline = fastestDecliningAnalysis(sortedVf);
   const octA = octAnalysis(sortedOct);
   const mdReg = regress(sortedVf, 'md', true); // Use robust Theil-Sen regression for MD
@@ -1926,7 +1721,6 @@ export default function App() {
                   <div style={{ display: 'flex', gap: 4 }}>
                     <button onClick={() => setVfMode('gpa')} style={{ padding: '4px 10px', borderRadius: 6, border: 'none', cursor: 'pointer', fontSize: 11, fontWeight: 500, background: vfMode === 'gpa' ? '#0891b2' : '#334155', color: vfMode === 'gpa' ? '#fff' : '#94a3b8' }}>GPA</button>
                     <button onClick={() => setVfMode('plr')} style={{ padding: '4px 10px', borderRadius: 6, border: 'none', cursor: 'pointer', fontSize: 11, fontWeight: 500, background: vfMode === 'plr' ? '#0891b2' : '#334155', color: vfMode === 'plr' ? '#fff' : '#94a3b8' }}>PLR</button>
-                    <button onClick={() => setVfMode('poplr')} style={{ padding: '4px 10px', borderRadius: 6, border: 'none', cursor: 'pointer', fontSize: 11, fontWeight: 500, background: vfMode === 'poplr' ? '#0891b2' : '#334155', color: vfMode === 'poplr' ? '#fff' : '#94a3b8' }}>PoPLR</button>
                   </div>
                 )}
               </div>
@@ -1941,12 +1735,12 @@ export default function App() {
                   <div style={{ background: 'linear-gradient(135deg, rgba(30,41,59,0.8), rgba(15,23,42,0.8))', borderRadius: 12, padding: 16, border: '1px solid #334155' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
                       <h3 style={{ margin: 0, fontSize: 14 }}>
-                        {vfMode === 'gpa' ? 'GPA Event Analysis' : vfMode === 'plr' ? 'Pointwise Linear Regression' : 'PoPLR Analysis'}
+                        {vfMode === 'gpa' ? 'GPA Event Analysis' : 'Pointwise Linear Regression'}
                       </h3>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                        <span style={{ width: 10, height: 10, borderRadius: '50%', background: statusColor(vfMode === 'gpa' ? gpa.status : vfMode === 'plr' ? plr.status : poplr.status) }} />
-                        <span style={{ fontWeight: 600, color: statusColor(vfMode === 'gpa' ? gpa.status : vfMode === 'plr' ? plr.status : poplr.status) }}>
-                          {statusText(vfMode === 'gpa' ? gpa.status : vfMode === 'plr' ? plr.status : poplr.status)}
+                        <span style={{ width: 10, height: 10, borderRadius: '50%', background: statusColor(vfMode === 'gpa' ? gpa.status : plr.status) }} />
+                        <span style={{ fontWeight: 600, color: statusColor(vfMode === 'gpa' ? gpa.status : plr.status) }}>
+                          {statusText(vfMode === 'gpa' ? gpa.status : plr.status)}
                         </span>
                       </div>
                     </div>
@@ -1988,76 +1782,15 @@ export default function App() {
                             <span style={{ fontWeight: 'bold', color: plr.avgSlope < -0.5 ? '#f87171' : '#10b981' }}>{plr.avgSlope.toFixed(2)} dB/yr</span>
                           </div>
                           <div style={{ fontSize: 9, color: '#64748b', textAlign: 'center', marginTop: 4 }}>
-                            Progressing = slope &lt; 0 at P &lt; 0.01
+                            Progressing = slope &lt; 0 at P &lt; 0.05
                           </div>
                         </div>
-                      </>
-                    ) : (
-                      /* PoPLR Display */
-                      <>
-                        {sortedVf.length < 4 ? (
-                          <div style={{ padding: 16, textAlign: 'center', color: '#94a3b8' }}>
-                            <p style={{ margin: 0 }}>PoPLR requires at least 4 VF tests</p>
-                            <p style={{ margin: '8px 0 0', fontSize: 12 }}>Current: {sortedVf.length} tests</p>
-                          </div>
-                        ) : (
-                          <>
-                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
-                              <div style={{ textAlign: 'center', padding: 10, background: 'rgba(30,41,59,0.5)', borderRadius: 6 }}>
-                                <p style={{ fontSize: 20, fontWeight: 'bold', color: poplr.pValue !== null && poplr.pValue < 0.05 ? '#f87171' : '#10b981', margin: 0 }}>
-                                  {poplr.pValue !== null ? (poplr.pValue < 0.001 ? '<0.001' : poplr.pValue.toFixed(3)) : '—'}
-                                </p>
-                                <p style={{ fontSize: 10, color: '#64748b', margin: '4px 0 0' }}>Global p-value</p>
-                              </div>
-                              <div style={{ textAlign: 'center', padding: 10, background: 'rgba(30,41,59,0.5)', borderRadius: 6 }}>
-                                <p style={{ fontSize: 20, fontWeight: 'bold', color: '#22d3ee', margin: 0 }}>
-                                  {poplr.sStatistic !== null ? poplr.sStatistic.toFixed(1) : '—'}
-                                </p>
-                                <p style={{ fontSize: 10, color: '#64748b', margin: '4px 0 0' }}>S-statistic</p>
-                              </div>
-                              <div style={{ textAlign: 'center', padding: 10, background: 'rgba(30,41,59,0.5)', borderRadius: 6 }}>
-                                <p style={{ fontSize: 20, fontWeight: 'bold', color: '#f87171', margin: 0 }}>
-                                  {poplr.significantPoints || 0}
-                                </p>
-                                <p style={{ fontSize: 10, color: '#64748b', margin: '4px 0 0' }}>Significant (p&lt;0.01)</p>
-                              </div>
-                            </div>
-                            
-                            <div style={{ marginTop: 12, padding: 12, background: 'rgba(30,41,59,0.3)', borderRadius: 8 }}>
-                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                                <span style={{ fontSize: 12, color: '#94a3b8' }}>Progression Status:</span>
-                                <span style={{ 
-                                  fontSize: 12, 
-                                  fontWeight: 600, 
-                                  padding: '2px 8px', 
-                                  borderRadius: 4,
-                                  background: poplr.progressing ? 'rgba(239,68,68,0.2)' : 'rgba(16,185,129,0.2)',
-                                  color: poplr.progressing ? '#f87171' : '#10b981'
-                                }}>
-                                  {poplr.progressing ? 'PROGRESSING' : 'STABLE'}
-                                </span>
-                              </div>
-                              
-                              <div style={{ fontSize: 11, color: '#64748b', lineHeight: 1.5 }}>
-                                <p style={{ margin: '0 0 4px' }}>
-                                  • p {'<'} 0.05: Possible Progression
-                                </p>
-                                <p style={{ margin: '0 0 4px' }}>
-                                  • p {'<'} 0.01: Likely Progression
-                                </p>
-                                <p style={{ margin: 0, fontSize: 10, fontStyle: 'italic' }}>
-                                  Based on {poplr.numPermutations?.toLocaleString() || 5000} permutations
-                                </p>
-                              </div>
-                            </div>
-                          </>
-                        )}
                       </>
                     )}
                   </div>
                   
                   {/* VF Grid */}
-                  <VFGrid gpa={gpa} plr={plr} poplr={poplr} mode={vfMode} eye={sortedVf[0]?.eye || 'OD'} />
+                  <VFGrid gpa={gpa} plr={plr} mode={vfMode} eye={sortedVf[0]?.eye || 'OD'} />
                 </>
               )}
             </div>
