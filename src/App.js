@@ -990,13 +990,17 @@ const poplrAnalysis = tests => {
     progressing = true;
   }
   
+  // Count points that are statistically significant (slope < 0 AND p < 0.01)
+  const significantPoints = locationData.filter(l => l.slope < 0 && l.pValue < 0.01).length;
+  
   return {
     status,
     sStatistic: observedS,
     pValue: globalPValue,
     progressing,
     numPermutations,
-    pointsUsed: locationData.length,
+    pointsUsed: locationData.length, // All declining locations (used for S-stat)
+    significantPoints, // Only statistically significant (p < 0.01)
     locationData, // Include for detailed analysis
     pattern
   };
@@ -1052,24 +1056,27 @@ const VFGrid = ({ gpa, plr, poplr, mode, eye = 'OD' }) => {
   // Point radius - smaller for 10-2 since points are denser
   const pointRadius = is10_2 ? 6 : 4;
   
-  // For PoPLR, get the declining location indices
-  const poplrDeclining = new Set(poplr?.locationData?.map(l => l.index) || []);
+  // For PoPLR, get the declining location indices that are STATISTICALLY SIGNIFICANT
+  // Only flag points with slope < 0 AND p < 0.01 (matching PLR criteria)
+  const poplrSignificant = new Set(
+    (poplr?.locationData || [])
+      .filter(l => l.slope < 0 && l.pValue < 0.01)
+      .map(l => l.index)
+  );
   
   const getColor = (p, idx) => {
     if (mode === 'poplr') {
-      // Color points based on whether they contribute to PoPLR S-statistic
-      if (poplrDeclining.has(idx)) {
-        // Declining location - color by slope severity
+      // Only color points that are statistically significant (slope < 0 AND p < 0.01)
+      if (poplrSignificant.has(idx)) {
         const loc = poplr.locationData?.find(l => l.index === idx);
         if (loc) {
           if (loc.slope <= -1.5) return '#EF4444'; // Fast decline
           if (loc.slope <= -1.0) return '#F97316'; // Moderate decline
-          if (loc.slope <= -0.5) return '#FBBF24'; // Slow decline
-          return '#F59E0B'; // Minimal decline
+          return '#FBBF24'; // Slower but significant decline
         }
-        return '#F59E0B';
+        return '#EF4444';
       }
-      return '#10B981'; // Stable/improving
+      return '#10B981'; // Not significant
     }
     if (mode === 'plr') {
       if (p.status === 'significant') return '#EF4444'; // Slope < 0 and P < 0.01
@@ -1088,7 +1095,7 @@ const VFGrid = ({ gpa, plr, poplr, mode, eye = 'OD' }) => {
   
   const getStroke = (p, idx) => {
     if (mode === 'poplr') {
-      return poplrDeclining.has(idx) ? '#fff' : 'none';
+      return poplrSignificant.has(idx) ? '#fff' : 'none';
     }
     if (mode === 'plr') return p.status === 'significant' ? '#fff' : 'none';
     return gpa.prog.some(x => x.id === p.id) ? '#fff' : gpa.poss.some(x => x.id === p.id) ? '#fbbf24' : 'none';
@@ -1098,7 +1105,8 @@ const VFGrid = ({ gpa, plr, poplr, mode, eye = 'OD' }) => {
     if (mode === 'poplr') {
       const loc = poplr?.locationData?.find(l => l.index === idx);
       if (loc) {
-        return `(${p.x}°, ${p.y}°)\nSlope: ${loc.slope.toFixed(2)} dB/yr\np=${loc.pValue.toFixed(3)}\nContributes to S-stat`;
+        const isSignificant = loc.slope < 0 && loc.pValue < 0.01;
+        return `(${p.x}°, ${p.y}°)\nSlope: ${loc.slope.toFixed(2)} dB/yr\np=${loc.pValue < 0.001 ? '<0.001' : loc.pValue.toFixed(3)}${isSignificant ? '\n⚠️ Significant (p<0.01)' : ''}`;
       }
       return `(${p.x}°, ${p.y}°)\nStable/Improving`;
     }
@@ -1117,7 +1125,7 @@ const VFGrid = ({ gpa, plr, poplr, mode, eye = 'OD' }) => {
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
         <span style={{ fontSize: 13, fontWeight: 500 }}>{pattern} Visual Field ({eye})</span>
         <span style={{ fontSize: 11, color: '#64748b' }}>
-          {mode === 'poplr' ? 'PoPLR Declining' : mode === 'plr' ? 'PLR Slopes' : 'GPA Events'}
+          {mode === 'poplr' ? 'PoPLR Significant (p<0.01)' : mode === 'plr' ? 'PLR Slopes' : 'GPA Events'}
         </span>
       </div>
       
@@ -1205,31 +1213,49 @@ const MDSlopeChart = ({ tests }) => {
   const lastYears = (new Date(sorted[sorted.length - 1].date) - baseDate) / 31536000000;
   const projectionYears = lastYears + 2;
   
-  // Create data points with MD values
-  // Trend = best fit line value at each time point (y = intercept + slope * x)
-  const chartData = sorted.map((t, idx) => {
+  // Create data points with numerical X-axis (years from baseline)
+  const mdPoints = sorted.map((t) => {
     const years = (new Date(t.date) - baseDate) / 31536000000;
     return {
-      date: t.date,
+      years,
       label: new Date(t.date).toLocaleDateString('en', { month: 'short', year: '2-digit' }),
       md: t.md,
-      years,
-      trend: intercept + slope * years, // Best fit value at this time point
     };
   });
   
-  // Add projection point
-  chartData.push({
-    label: '+2yr',
-    md: null,
-    trend: intercept + slope * projectionYears,
-    isProjection: true,
-  });
+  // Best fit line - only need 2 points for a straight line
+  const trendLine = [
+    { years: 0, trend: intercept },
+    { years: projectionYears, trend: intercept + slope * projectionYears },
+  ];
+  
+  // Combine for chart - MD points + trend endpoints
+  const allData = [
+    ...mdPoints.map(p => ({ ...p, trend: null })),
+    { years: projectionYears, label: '+2yr', md: null, trend: intercept + slope * projectionYears },
+  ];
+  
+  // For the trend line, we need separate data with just start and end
+  const trendData = [
+    { years: 0, trend: intercept },
+    { years: projectionYears, trend: intercept + slope * projectionYears },
+  ];
   
   // Progression status based on -0.5 dB/year threshold
   const isProgressing = slope < MD_SLOPE_THRESHOLD;
   const rateLabel = slope >= -0.5 ? 'Stable' : slope > -1 ? 'Progressing' : slope > -2 ? 'Moderate' : 'Fast';
   const rateColor = slope >= -0.5 ? '#34d399' : slope > -1 ? '#fbbf24' : slope > -2 ? '#f97316' : '#ef4444';
+  
+  // Custom tick formatter for X-axis
+  const formatXAxis = (years) => {
+    if (years === 0) return mdPoints[0]?.label || '0';
+    if (years >= projectionYears - 0.1) return '+2yr';
+    // Find closest data point
+    const closest = mdPoints.reduce((prev, curr) => 
+      Math.abs(curr.years - years) < Math.abs(prev.years - years) ? curr : prev
+    );
+    return closest.label;
+  };
   
   return (
     <div style={{ background: '#0f172a', borderRadius: 12, padding: 16, border: '1px solid #334155' }}>
@@ -1246,14 +1272,42 @@ const MDSlopeChart = ({ tests }) => {
       
       <div style={{ height: 180 }}>
         <ResponsiveContainer>
-          <ComposedChart data={chartData} margin={{ top: 10, right: 10, left: -15, bottom: 0 }}>
+          <ComposedChart margin={{ top: 10, right: 10, left: -15, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-            <XAxis dataKey="label" tick={{ fill: '#94a3b8', fontSize: 10 }} axisLine={{ stroke: '#475569' }} />
+            <XAxis 
+              dataKey="years" 
+              type="number" 
+              domain={[0, projectionYears]} 
+              tickFormatter={formatXAxis}
+              tick={{ fill: '#94a3b8', fontSize: 10 }} 
+              axisLine={{ stroke: '#475569' }}
+              allowDuplicatedCategory={false}
+            />
             <YAxis tick={{ fill: '#94a3b8', fontSize: 10 }} axisLine={{ stroke: '#475569' }} />
             <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid #334155', borderRadius: 8, fontSize: 12 }} />
             <ReferenceLine y={0} stroke="#475569" strokeDasharray="3 3" />
-            <Line type="linear" dataKey="trend" stroke={isProgressing ? '#ef4444' : '#06b6d4'} strokeWidth={2} dot={false} name="Best Fit" />
-            <Line type="linear" dataKey="md" stroke="#22d3ee" strokeWidth={0} dot={{ fill: '#22d3ee', r: 4, stroke: '#0f172a', strokeWidth: 2 }} connectNulls={false} name="MD" />
+            {/* Best fit straight line - just 2 points */}
+            <Line 
+              data={trendData} 
+              type="linear" 
+              dataKey="trend" 
+              stroke={isProgressing ? '#ef4444' : '#06b6d4'} 
+              strokeWidth={2} 
+              dot={false} 
+              name="Best Fit"
+              isAnimationActive={false}
+            />
+            {/* MD data points - dots only, no connecting line */}
+            <Line 
+              data={mdPoints} 
+              type="linear" 
+              dataKey="md" 
+              stroke="transparent" 
+              strokeWidth={0} 
+              dot={{ fill: '#22d3ee', r: 5, stroke: '#0f172a', strokeWidth: 2 }} 
+              name="MD"
+              isAnimationActive={false}
+            />
           </ComposedChart>
         </ResponsiveContainer>
       </div>
@@ -1962,10 +2016,10 @@ export default function App() {
                                 <p style={{ fontSize: 10, color: '#64748b', margin: '4px 0 0' }}>S-statistic</p>
                               </div>
                               <div style={{ textAlign: 'center', padding: 10, background: 'rgba(30,41,59,0.5)', borderRadius: 6 }}>
-                                <p style={{ fontSize: 20, fontWeight: 'bold', color: '#a78bfa', margin: 0 }}>
-                                  {poplr.pointsUsed || 0}
+                                <p style={{ fontSize: 20, fontWeight: 'bold', color: '#f87171', margin: 0 }}>
+                                  {poplr.significantPoints || 0}
                                 </p>
-                                <p style={{ fontSize: 10, color: '#64748b', margin: '4px 0 0' }}>Declining Locs</p>
+                                <p style={{ fontSize: 10, color: '#64748b', margin: '4px 0 0' }}>Significant (p&lt;0.01)</p>
                               </div>
                             </div>
                             
