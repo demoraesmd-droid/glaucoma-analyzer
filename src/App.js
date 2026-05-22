@@ -129,7 +129,7 @@ const getGPAThreshold = (td, pattern = '24-2', md = 0) => {
 };
 
 // PLR thresholds
-const PLR_THRESHOLDS = { significant: -1.0, borderline: -0.5 };
+const PLR_THRESHOLDS = { pValueCutoff: 0.01 }; // Flag points with slope < 0 at P < 0.01
 
 // Blind spot locations
 const BLIND_SPOT = { OD: { x: 15, y: -3 }, OS: { x: -15, y: -3 } };
@@ -552,12 +552,83 @@ const linearRegression = (x, y) => {
   return { slope, intercept, r2, se, pValue, ciLower, ciUpper };
 };
 
-// Regression helper for test data
-const regress = (data, key) => {
+// Robust Linear Regression using Theil-Sen Estimator
+// More resistant to outliers than OLS
+const robustLinearRegression = (x, y) => {
+  const n = x.length;
+  if (n < 2) return null;
+  
+  // Filter out any NaN or null values
+  const validPairs = x.map((xi, i) => ({ x: xi, y: y[i] }))
+    .filter(p => !isNaN(p.x) && !isNaN(p.y) && p.x !== null && p.y !== null);
+  
+  if (validPairs.length < 2) return null;
+  
+  const xValid = validPairs.map(p => p.x);
+  const yValid = validPairs.map(p => p.y);
+  const nValid = validPairs.length;
+  
+  // Calculate all pairwise slopes
+  const slopes = [];
+  for (let i = 0; i < nValid; i++) {
+    for (let j = i + 1; j < nValid; j++) {
+      if (xValid[j] !== xValid[i]) {
+        slopes.push((yValid[j] - yValid[i]) / (xValid[j] - xValid[i]));
+      }
+    }
+  }
+  
+  if (slopes.length === 0) return null;
+  
+  // Theil-Sen slope is the median of all pairwise slopes
+  slopes.sort((a, b) => a - b);
+  const medianIdx = Math.floor(slopes.length / 2);
+  const slope = slopes.length % 2 === 0 
+    ? (slopes[medianIdx - 1] + slopes[medianIdx]) / 2 
+    : slopes[medianIdx];
+  
+  // Intercept is median of (y_i - slope * x_i)
+  const intercepts = xValid.map((xi, i) => yValid[i] - slope * xi);
+  intercepts.sort((a, b) => a - b);
+  const intIdx = Math.floor(intercepts.length / 2);
+  const intercept = intercepts.length % 2 === 0 
+    ? (intercepts[intIdx - 1] + intercepts[intIdx]) / 2 
+    : intercepts[intIdx];
+  
+  // Calculate R² and standard error using OLS formulas for compatibility
+  const yMean = yValid.reduce((a, b) => a + b, 0) / nValid;
+  const ssTotal = yValid.reduce((s, yi) => s + (yi - yMean) ** 2, 0);
+  const ssRes = yValid.reduce((s, yi, i) => s + (yi - (intercept + slope * xValid[i])) ** 2, 0);
+  const r2 = ssTotal > 0 ? 1 - ssRes / ssTotal : 0;
+  
+  // Approximate SE and p-value using residuals
+  const sx2 = xValid.reduce((s, xi) => s + (xi - xValid.reduce((a,b)=>a+b,0)/nValid) ** 2, 0);
+  const se = nValid > 2 ? Math.sqrt(ssRes / (nValid - 2) / sx2) : 0;
+  const tStat = se > 0 ? Math.abs(slope / se) : 0;
+  
+  const tCrit = 2.776;
+  const ciLower = slope - tCrit * se;
+  const ciUpper = slope + tCrit * se;
+  
+  let pValue = 1;
+  if (tStat > 4.0) pValue = 0.001;
+  else if (tStat > 3.0) pValue = 0.01;
+  else if (tStat > 2.5) pValue = 0.02;
+  else if (tStat > 2.0) pValue = 0.05;
+  else if (tStat > 1.5) pValue = 0.1;
+  
+  return { slope, intercept, r2, se, pValue, ciLower, ciUpper, method: 'theil-sen' };
+};
+
+// MD Slope threshold for progression
+const MD_SLOPE_THRESHOLD = -0.5; // dB/year - flag as progressing if slope < this
+
+// Regression helper for test data (uses robust regression for MD)
+const regress = (data, key, useRobust = false) => {
   if (data.length < 2) return null;
   const x = data.map(d => (new Date(d.date) - new Date(data[0].date)) / 31536000000);
   const y = data.map(d => d[key]);
-  return linearRegression(x, y);
+  return useRobust ? robustLinearRegression(x, y) : linearRegression(x, y);
 };
 
 // GPA Analysis
@@ -610,7 +681,7 @@ const gpaAnalysis = tests => {
 // PLR Analysis
 const plrAnalysis = tests => {
   if (tests.length < 3 || !tests[0].td?.length) {
-    return { status: 'insufficient', points: [], significant: 0, borderline: 0, stable: 0, improving: 0, avgSlope: 0, pattern: '24-2' };
+    return { status: 'insufficient', points: [], significant: 0, stable: 0, improving: 0, avgSlope: 0, pattern: '24-2' };
   }
   
   const sorted = [...tests].sort((a, b) => new Date(a.date) - new Date(b.date));
@@ -623,7 +694,7 @@ const plrAnalysis = tests => {
   const gridSize = getVFGridSize(pattern);
   
   const points = [];
-  let significant = 0, borderline = 0, stable = 0, improving = 0;
+  let significant = 0, stable = 0, improving = 0;
   
   for (let i = 0; i < gridSize; i++) {
     const tdValues = sorted.map(t => t.td?.[i]?.td).filter(v => v != null);
@@ -634,12 +705,14 @@ const plrAnalysis = tests => {
     
     const loc = grid[i];
     let status = 'stable';
-    if (reg.slope <= PLR_THRESHOLDS.significant && reg.pValue < 0.05) {
-      status = 'significant'; significant++;
-    } else if (reg.slope <= PLR_THRESHOLDS.borderline) {
-      status = 'borderline'; borderline++;
+    
+    // Flag as significant if slope < 0 AND p < 0.01
+    if (reg.slope < 0 && reg.pValue < PLR_THRESHOLDS.pValueCutoff) {
+      status = 'significant'; 
+      significant++;
     } else if (reg.slope > 0.5) {
-      status = 'improving'; improving++;
+      status = 'improving'; 
+      improving++;
     } else {
       stable++;
     }
@@ -649,11 +722,11 @@ const plrAnalysis = tests => {
   
   let overallStatus = 'stable';
   if (significant >= 3) overallStatus = 'likely';
-  else if (significant >= 1 || borderline >= 3) overallStatus = 'possible';
+  else if (significant >= 1) overallStatus = 'possible';
   
   const avgSlope = points.length > 0 ? points.reduce((s, p) => s + p.slope, 0) / points.length : 0;
   
-  return { status: overallStatus, points, significant, borderline, stable, improving, avgSlope, pattern };
+  return { status: overallStatus, points, significant, stable, improving, avgSlope, pattern };
 };
 
 // Fastest Declining Points Analysis
@@ -771,8 +844,23 @@ const fastestDecliningAnalysis = tests => {
 };
 
 // PoPLR Analysis (Permutation of Pointwise Linear Regression)
-// Based on: O'Leary et al. "Asymmetric progression of visual field defects in glaucoma"
-// The S-statistic combines p-values from locations with negative slopes
+// Reference: O'Leary et al. "Asymmetric progression of visual field defects in glaucoma"
+// 
+// METHODOLOGY:
+// 1. For each test location, fit linear regression of TD vs time
+// 2. For locations with NEGATIVE slopes (worsening), record the p-value
+// 3. Calculate S-statistic = Σ(-log10(p)) for all negative-slope locations
+//    - Higher S means more/stronger declining locations
+// 4. Permutation test: Shuffle temporal order of tests 5000 times
+//    - For each permutation, recalculate slopes and S-statistic
+//    - This breaks the temporal structure (null hypothesis: no progression)
+// 5. Global p-value = proportion of permuted S >= observed S
+//    - If observed S is rarely exceeded by chance, progression is significant
+//
+// INTERPRETATION:
+// - p < 0.01: Likely progression
+// - p < 0.05: Possible progression
+// - p >= 0.05: Stable (no significant progression detected)
 const poplrAnalysis = tests => {
   if (tests.length < 4 || !tests[0].td?.length) {
     return { 
@@ -806,7 +894,7 @@ const poplrAnalysis = tests => {
     const reg = linearRegression(validYears, tdValues);
     if (!reg) continue;
     
-    // Only include locations with negative slopes (progressing)
+    // Only include locations with negative slopes (potential progression)
     if (reg.slope < 0) {
       locationData.push({
         index: i,
@@ -831,10 +919,10 @@ const poplrAnalysis = tests => {
   }
   
   // Step 2: Calculate S-statistic (sum of -log10(p) for negative slopes)
-  // Using truncated p-values to avoid log(0)
+  // Truncate p-values at 0.0001 to avoid log(0)
   const calcSStatistic = (pValues) => {
     return pValues.reduce((sum, p) => {
-      const truncP = Math.max(p, 0.0001); // Truncate to avoid log(0)
+      const truncP = Math.max(p, 0.0001);
       return sum + (-Math.log10(truncP));
     }, 0);
   };
@@ -984,10 +1072,9 @@ const VFGrid = ({ gpa, plr, poplr, mode, eye = 'OD' }) => {
       return '#10B981'; // Stable/improving
     }
     if (mode === 'plr') {
-      if (p.status === 'significant') return '#EF4444';
-      if (p.status === 'borderline') return '#F59E0B';
+      if (p.status === 'significant') return '#EF4444'; // Slope < 0 and P < 0.01
       if (p.status === 'improving') return '#3B82F6';
-      return '#10B981';
+      return '#10B981'; // Stable
     }
     const isProg = gpa.prog.some(x => x.id === p.id);
     const isPoss = gpa.poss.some(x => x.id === p.id);
@@ -1108,56 +1195,76 @@ const VFGrid = ({ gpa, plr, poplr, mode, eye = 'OD' }) => {
 // MD Slope Chart Component
 const MDSlopeChart = ({ tests }) => {
   const sorted = [...tests].sort((a, b) => new Date(a.date) - new Date(b.date));
-  const reg = regress(sorted, 'md');
+  const reg = regress(sorted, 'md', true); // Use robust Theil-Sen regression
   if (!reg || sorted.length < 2) return null;
   
   const { slope, intercept, r2, pValue, ciLower, ciUpper } = reg;
   const baseDate = new Date(sorted[0].date);
   
+  // Create data points for MD values and straight trend line
   const chartData = sorted.map(t => {
     const years = (new Date(t.date) - baseDate) / 31536000000;
-    const trend = intercept + slope * years;
     return {
       date: t.date,
       label: new Date(t.date).toLocaleDateString('en', { month: 'short', year: '2-digit' }),
       md: t.md,
-      trend,
+      years,
     };
   });
   
-  // Add projection
+  // Calculate trend line endpoints (straight line)
+  const firstYears = 0;
   const lastYears = (new Date(sorted[sorted.length - 1].date) - baseDate) / 31536000000;
-  [1, 2].forEach(y => {
-    chartData.push({
-      label: `+${y}yr`,
-      md: null,
-      trend: intercept + slope * (lastYears + y),
-      isProjection: true,
-    });
+  const projectionYears = lastYears + 2; // Project 2 years ahead
+  
+  // Add trend line points (just start and end for straight line)
+  const trendData = [
+    { years: firstYears, trend: intercept + slope * firstYears, label: chartData[0].label },
+    { years: lastYears, trend: intercept + slope * lastYears, label: chartData[chartData.length - 1].label },
+    { years: projectionYears, trend: intercept + slope * projectionYears, label: '+2yr', isProjection: true },
+  ];
+  
+  // Merge MD data with trend line
+  const combinedData = chartData.map(d => ({
+    ...d,
+    trend: intercept + slope * d.years,
+  }));
+  
+  // Add projection point
+  combinedData.push({
+    label: '+2yr',
+    md: null,
+    trend: intercept + slope * projectionYears,
+    isProjection: true,
   });
   
-  const rateLabel = slope > -0.5 ? 'Stable' : slope > -1 ? 'Slow' : slope > -2 ? 'Moderate' : 'Fast';
-  const rateColor = slope > -0.5 ? '#34d399' : slope > -1 ? '#fbbf24' : slope > -2 ? '#f97316' : '#ef4444';
+  // Progression status based on -0.5 dB/year threshold
+  const isProgressing = slope < MD_SLOPE_THRESHOLD;
+  const rateLabel = slope >= -0.5 ? 'Stable' : slope > -1 ? 'Progressing' : slope > -2 ? 'Moderate' : 'Fast';
+  const rateColor = slope >= -0.5 ? '#34d399' : slope > -1 ? '#fbbf24' : slope > -2 ? '#f97316' : '#ef4444';
   
   return (
     <div style={{ background: '#0f172a', borderRadius: 12, padding: 16, border: '1px solid #334155' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
         <div>
           <div style={{ fontSize: 13, fontWeight: 500 }}>MD Slope Analysis</div>
-          <div style={{ fontSize: 11, color: '#64748b' }}>Linear regression over time</div>
+          <div style={{ fontSize: 11, color: '#64748b' }}>Robust linear regression (Theil-Sen)</div>
         </div>
-        <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, background: `${rateColor}20`, color: rateColor }}>{rateLabel}</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {isProgressing && <span style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: 'rgba(239,68,68,0.2)', color: '#ef4444' }}>PROGRESSING</span>}
+          <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 4, background: `${rateColor}20`, color: rateColor }}>{rateLabel}</span>
+        </div>
       </div>
       
       <div style={{ height: 180 }}>
         <ResponsiveContainer>
-          <ComposedChart data={chartData} margin={{ top: 10, right: 10, left: -15, bottom: 0 }}>
+          <ComposedChart data={combinedData} margin={{ top: 10, right: 10, left: -15, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
             <XAxis dataKey="label" tick={{ fill: '#94a3b8', fontSize: 10 }} axisLine={{ stroke: '#475569' }} />
             <YAxis tick={{ fill: '#94a3b8', fontSize: 10 }} axisLine={{ stroke: '#475569' }} />
             <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid #334155', borderRadius: 8, fontSize: 12 }} />
             <ReferenceLine y={0} stroke="#475569" strokeDasharray="3 3" />
-            <Line type="monotone" dataKey="trend" stroke="#06b6d4" strokeWidth={2} strokeDasharray="5 3" dot={false} />
+            <Line type="linear" dataKey="trend" stroke={isProgressing ? '#ef4444' : '#06b6d4'} strokeWidth={2} dot={false} />
             <Line type="monotone" dataKey="md" stroke="#22d3ee" strokeWidth={2} dot={{ fill: '#22d3ee', r: 4, stroke: '#0f172a', strokeWidth: 2 }} connectNulls={false} />
           </ComposedChart>
         </ResponsiveContainer>
@@ -1165,7 +1272,7 @@ const MDSlopeChart = ({ tests }) => {
       
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginTop: 12 }}>
         <div style={{ textAlign: 'center', padding: 8, background: '#1e293b', borderRadius: 6 }}>
-          <div style={{ fontSize: 16, fontWeight: 'bold', color: '#22d3ee' }}>{slope.toFixed(2)}</div>
+          <div style={{ fontSize: 16, fontWeight: 'bold', color: isProgressing ? '#ef4444' : '#22d3ee' }}>{slope.toFixed(2)}</div>
           <div style={{ fontSize: 10, color: '#64748b' }}>dB/year</div>
         </div>
         <div style={{ textAlign: 'center', padding: 8, background: '#1e293b', borderRadius: 6 }}>
@@ -1180,6 +1287,10 @@ const MDSlopeChart = ({ tests }) => {
           <div style={{ fontSize: 16, fontWeight: 'bold', color: pValue < 0.05 ? '#f87171' : '#94a3b8' }}>{pValue < 0.001 ? '<.001' : pValue.toFixed(3)}</div>
           <div style={{ fontSize: 10, color: '#64748b' }}>p-value</div>
         </div>
+      </div>
+      
+      <div style={{ marginTop: 8, padding: 8, background: 'rgba(30,41,59,0.3)', borderRadius: 6, fontSize: 10, color: '#64748b' }}>
+        Threshold: slope &lt; -0.5 dB/year = Progressing
       </div>
     </div>
   );
@@ -1308,7 +1419,7 @@ export default function App() {
   const poplr = poplrAnalysis(sortedVf);
   const fastestDecline = fastestDecliningAnalysis(sortedVf);
   const octA = octAnalysis(sortedOct);
-  const mdReg = regress(sortedVf, 'md');
+  const mdReg = regress(sortedVf, 'md', true); // Use robust Theil-Sen regression for MD
   
   // Process single PDF file
   const processPDF = async (file, onProgress) => {
@@ -1815,14 +1926,10 @@ export default function App() {
                       </div>
                     ) : vfMode === 'plr' ? (
                       <>
-                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8 }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
                           <div style={{ textAlign: 'center', padding: 8, background: 'rgba(30,41,59,0.5)', borderRadius: 6 }}>
                             <p style={{ fontSize: 18, fontWeight: 'bold', color: '#f87171', margin: 0 }}>{plr.significant}</p>
-                            <p style={{ fontSize: 9, color: '#64748b', margin: '2px 0 0' }}>Significant</p>
-                          </div>
-                          <div style={{ textAlign: 'center', padding: 8, background: 'rgba(30,41,59,0.5)', borderRadius: 6 }}>
-                            <p style={{ fontSize: 18, fontWeight: 'bold', color: '#fbbf24', margin: 0 }}>{plr.borderline}</p>
-                            <p style={{ fontSize: 9, color: '#64748b', margin: '2px 0 0' }}>Borderline</p>
+                            <p style={{ fontSize: 9, color: '#64748b', margin: '2px 0 0' }}>Progressing</p>
                           </div>
                           <div style={{ textAlign: 'center', padding: 8, background: 'rgba(30,41,59,0.5)', borderRadius: 6 }}>
                             <p style={{ fontSize: 18, fontWeight: 'bold', color: '#10b981', margin: 0 }}>{plr.stable}</p>
@@ -1833,9 +1940,14 @@ export default function App() {
                             <p style={{ fontSize: 9, color: '#64748b', margin: '2px 0 0' }}>Improving</p>
                           </div>
                         </div>
-                        <div style={{ marginTop: 8, padding: 8, background: 'rgba(30,41,59,0.3)', borderRadius: 6, textAlign: 'center' }}>
-                          <span style={{ fontSize: 11, color: '#94a3b8' }}>Mean Slope: </span>
-                          <span style={{ fontWeight: 'bold', color: plr.avgSlope < -0.5 ? '#f87171' : '#10b981' }}>{plr.avgSlope.toFixed(2)} dB/yr</span>
+                        <div style={{ marginTop: 8, padding: 8, background: 'rgba(30,41,59,0.3)', borderRadius: 6 }}>
+                          <div style={{ textAlign: 'center' }}>
+                            <span style={{ fontSize: 11, color: '#94a3b8' }}>Mean Slope: </span>
+                            <span style={{ fontWeight: 'bold', color: plr.avgSlope < -0.5 ? '#f87171' : '#10b981' }}>{plr.avgSlope.toFixed(2)} dB/yr</span>
+                          </div>
+                          <div style={{ fontSize: 9, color: '#64748b', textAlign: 'center', marginTop: 4 }}>
+                            Progressing = slope &lt; 0 at P &lt; 0.01
+                          </div>
                         </div>
                       </>
                     ) : (
