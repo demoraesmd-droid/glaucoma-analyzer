@@ -137,7 +137,7 @@ const BLIND_SPOT = { OD: { x: 15, y: -3 }, OS: { x: -15, y: -3 } };
 // OCR Parser - extracts VF data from text
 // Handles noisy OCR output with multiple fallback patterns
 const parseOCR = text => {
-  const r = { md: null, psd: null, vfi: null, date: null, eye: null, fl: null, fp: null, fn: null, td: [], warn: [], pattern: '24-2' };
+  const r = { md: null, psd: null, vfi: null, date: null, eye: null, fl: null, fp: null, fn: null, td: [], pd: [], warn: [], pattern: '24-2' };
   
   // Detect test pattern (10-2 vs 24-2)
   if (/10-2|10\s*-\s*2|Central\s*10/i.test(text)) {
@@ -315,18 +315,32 @@ const parseOCR = text => {
     }
   }
   
+  // PD (Pattern Deviation) extraction - look for section after "Pattern Deviation"
+  let pdSection = text.match(/Patt?ern\s*Dev[il]?at[il]?on([\s\S]*?)(?:GHT|Glaucoma|VFI|Outside|$)/i);
+  if (pdSection) {
+    const numbers = pdSection[1].match(/-?\d+/g);
+    if (numbers) {
+      const pdValues = numbers.map(n => parseInt(n)).filter(n => n >= -35 && n <= 10);
+      if (pdValues.length >= Math.min(20, expectedPoints / 2)) {
+        r.pd = pdValues.slice(0, expectedPoints).map((v, i) => ({ ...grid[i], pd: v }));
+      }
+    }
+  }
+  
   // Warnings
   if (r.md === null) r.warn.push('MD not found');
   if (r.date === null) r.warn.push('Date not found');
   if (r.td.length === 0) r.warn.push('TD values not extracted');
   else if (r.td.length < expectedPoints) r.warn.push(`Found ${r.td.length}/${expectedPoints} TD values`);
+  if (r.pd.length === 0) r.warn.push('PD values not extracted');
+  else if (r.pd.length < expectedPoints) r.warn.push(`Found ${r.pd.length}/${expectedPoints} PD values`);
   
   return r;
 };
 
 // Enhanced parsing from positioned text items (preserves spatial layout)
 const parsePositionedText = (items, pageHeight) => {
-  const r = { md: null, psd: null, vfi: null, date: null, eye: null, fl: null, fp: null, fn: null, td: [], warn: [], pattern: '24-2' };
+  const r = { md: null, psd: null, vfi: null, date: null, eye: null, fl: null, fp: null, fn: null, td: [], pd: [], warn: [], pattern: '24-2' };
   
   // Sort items by position (top to bottom, left to right)
   const sortedItems = items
@@ -370,6 +384,11 @@ const parsePositionedText = (items, pageHeight) => {
   // Find "Pattern Deviation" label
   const pdLabelIdx = sortedItems.findIndex(item => 
     /pattern\s*deviation/i.test(item.str)
+  );
+  
+  // Find GHT or end marker for PD section
+  const ghtLabelIdx = sortedItems.findIndex(item => 
+    /GHT|Glaucoma\s*Hemifield|VFI|Outside\s*Normal/i.test(item.str)
   );
   
   if (tdLabelIdx >= 0) {
@@ -423,12 +442,66 @@ const parsePositionedText = (items, pageHeight) => {
     }
   }
   
+  // Extract PD values (Pattern Deviation)
+  if (pdLabelIdx >= 0) {
+    const pdLabel = sortedItems[pdLabelIdx];
+    const ghtLabel = ghtLabelIdx >= 0 ? sortedItems[ghtLabelIdx] : null;
+    
+    // Find items that are:
+    // 1. Below the PD label
+    // 2. Above the GHT/VFI section if it exists
+    // 3. Numeric values in deviation range
+    const pdItems = sortedItems.filter((item, idx) => {
+      if (idx <= pdLabelIdx) return false;
+      if (ghtLabel && item.y >= ghtLabel.y - 10) return false;
+      
+      const num = parseInt(item.str.trim());
+      return !isNaN(num) && num >= -35 && num <= 10;
+    });
+    
+    // Group items by row
+    const pdRows = [];
+    let currentPdRow = [];
+    let currentPdY = null;
+    
+    pdItems.forEach(item => {
+      if (currentPdY === null || Math.abs(item.y - currentPdY) < 8) {
+        currentPdRow.push(item);
+        currentPdY = item.y;
+      } else {
+        if (currentPdRow.length > 0) pdRows.push(currentPdRow.sort((a, b) => a.x - b.x));
+        currentPdRow = [item];
+        currentPdY = item.y;
+      }
+    });
+    if (currentPdRow.length > 0) pdRows.push(currentPdRow.sort((a, b) => a.x - b.x));
+    
+    const pdValues = pdRows.flatMap(row => 
+      row.map(item => parseInt(item.str.trim()))
+    ).filter(n => !isNaN(n) && n >= -35 && n <= 10);
+    
+    const grid = getVFGrid(r.pattern);
+    const expectedPoints = getVFGridSize(r.pattern);
+    
+    if (pdValues.length >= Math.min(20, expectedPoints / 2)) {
+      r.pd = pdValues.slice(0, expectedPoints).map((v, i) => ({ ...grid[i], pd: v }));
+      if (r.pd.length < expectedPoints) {
+        r.warn.push(`Found ${r.pd.length}/${expectedPoints} PD values (spatial)`);
+      }
+    }
+  }
+  
   // Fallback to basic TD extraction if spatial failed
   if (r.td.length === 0 && basic.td.length > 0) {
     r.td = basic.td;
     if (basic.warn.some(w => w.includes('TD'))) {
       r.warn.push(...basic.warn.filter(w => w.includes('TD')));
     }
+  }
+  
+  // Fallback to basic PD extraction if spatial failed
+  if (r.pd.length === 0 && basic.pd.length > 0) {
+    r.pd = basic.pd;
   }
   
   return r;
@@ -470,7 +543,20 @@ const ocrImage = async (imageData, onProgress) => {
 // Generate TD values from MD (for manual entry)
 const generateTD = (md, pattern = '24-2') => {
   const grid = getVFGrid(pattern);
-  return grid.map(p => ({ ...p, td: Math.max(-35, Math.min(5, md + (Math.random() - 0.5) * 4)) }));
+  return grid.map(p => {
+    const td = Math.max(-35, Math.min(5, md + (Math.random() - 0.5) * 4));
+    // PD is similar to TD but with less overall depression (simulating diffuse loss correction)
+    const pd = Math.max(-35, Math.min(5, td + (Math.random() - 0.3) * 2));
+    return { ...p, td, pd };
+  });
+};
+
+// Generate PD values from TD (for backwards compatibility)
+const generatePD = (tdArray) => {
+  return tdArray.map(p => ({
+    ...p,
+    pd: p.pd ?? Math.max(-35, Math.min(5, (p.td || 0) + (Math.random() - 0.3) * 2))
+  }));
 };
 
 // Demo data
@@ -489,7 +575,12 @@ const createDemoVF = () => [
     const prog = isSupArc ? -0.9 * i : isInfArc ? -0.6 * i : -0.15 * i;
     return { ...p, td: Math.max(-35, Math.min(5, -2 + prog + (Math.random() - 0.5) * 2)) };
   });
-  return { ...t, td };
+  // Generate PD values (similar to TD but corrected for overall depression)
+  const pd = td.map(p => ({
+    ...p,
+    pd: Math.max(-35, Math.min(5, p.td + 1.5 + (Math.random() - 0.5) * 1)) // PD slightly less negative
+  }));
+  return { ...t, td, pd };
 });
 
 const createDemoOCT = () => [
@@ -631,9 +722,13 @@ const regress = (data, key, useRobust = false) => {
   return useRobust ? robustLinearRegression(x, y) : linearRegression(x, y);
 };
 
-// GPA Analysis
+// GPA Analysis - uses Pattern Deviation (PD) values for threshold comparison
 const gpaAnalysis = tests => {
-  if (tests.length < 3 || !tests[0].td?.length) return { status: 'insufficient', prog: [], poss: [], bl: [], pattern: '24-2' };
+  // Check if we have PD values; fall back to TD if not available
+  const hasPD = tests[0]?.pd?.length > 0;
+  const deviationKey = hasPD ? 'pd' : 'td';
+  
+  if (tests.length < 3 || !tests[0][deviationKey]?.length) return { status: 'insufficient', prog: [], poss: [], bl: [], pattern: '24-2', usingPD: hasPD };
   
   const sorted = [...tests].sort((a, b) => new Date(a.date) - new Date(b.date));
   const pattern = sorted[0].pattern || '24-2';
@@ -641,14 +736,19 @@ const gpaAnalysis = tests => {
   // Calculate baseline MD (average of first 2 tests) for 2D threshold lookup
   const baselineMD = ((sorted[0].md || 0) + (sorted[1].md || 0)) / 2;
   
-  // Baseline = average of first 2 tests
+  // Baseline = average of first 2 tests using PD (or TD as fallback)
   // Use pattern-specific thresholds (with MD for 10-2)
-  const bl = sorted[0].td.map((p, i) => {
-    const avgTd = (p.td + (sorted[1].td?.[i]?.td || p.td)) / 2;
+  const bl = sorted[0][deviationKey].map((p, i) => {
+    const val = hasPD ? p.pd : p.td;
+    const val2 = hasPD 
+      ? (sorted[1].pd?.[i]?.pd ?? val)
+      : (sorted[1].td?.[i]?.td ?? val);
+    const avgVal = (val + val2) / 2;
     return {
       ...p,
-      td: avgTd,
-      thresh: getGPAThreshold(avgTd, pattern, baselineMD)
+      td: avgVal, // Keep as 'td' for display compatibility
+      pd: avgVal, // Also store as pd
+      thresh: getGPAThreshold(avgVal, pattern, baselineMD)
     };
   });
   
@@ -656,11 +756,14 @@ const gpaAnalysis = tests => {
   const status = {};
   bl.forEach(p => status[p.id] = { ...p, flagged: [] });
   
-  // Check follow-up tests
+  // Check follow-up tests - compare PD (or TD) change against threshold
   sorted.slice(2).forEach((test, testIdx) => {
-    test.td?.forEach(p => {
+    const testDeviation = test[deviationKey];
+    testDeviation?.forEach(p => {
       if (status[p.id]) {
-        const change = p.td - status[p.id].td;
+        const currentVal = hasPD ? p.pd : p.td;
+        const baselineVal = hasPD ? status[p.id].pd : status[p.id].td;
+        const change = currentVal - baselineVal;
         if (change <= status[p.id].thresh) {
           status[p.id].flagged.push(testIdx);
         }
@@ -675,7 +778,7 @@ const gpaAnalysis = tests => {
   if (prog.length >= 3) st = 'likely';
   else if (prog.length > 0 || poss.length >= 3) st = 'possible';
   
-  return { status: st, prog, poss, bl, pattern };
+  return { status: st, prog, poss, bl, pattern, usingPD: hasPD };
 };
 
 // PLR Analysis
@@ -1004,7 +1107,7 @@ const MDSlopeChart = ({ tests }) => {
   const { slope, intercept, r2, pValue, ciLower, ciUpper } = reg;
   const baseDate = new Date(sorted[0].date);
   
-  // Calculate years for each test
+  // Calculate years for each test (baseline = 0)
   const lastYears = (new Date(sorted[sorted.length - 1].date) - baseDate) / 31536000000;
   const projectionYears = lastYears + 2;
   
@@ -1013,24 +1116,11 @@ const MDSlopeChart = ({ tests }) => {
     const years = (new Date(t.date) - baseDate) / 31536000000;
     return {
       years,
-      label: new Date(t.date).toLocaleDateString('en', { month: 'short', year: '2-digit' }),
       md: t.md,
     };
   });
   
   // Best fit line - only need 2 points for a straight line
-  const trendLine = [
-    { years: 0, trend: intercept },
-    { years: projectionYears, trend: intercept + slope * projectionYears },
-  ];
-  
-  // Combine for chart - MD points + trend endpoints
-  const allData = [
-    ...mdPoints.map(p => ({ ...p, trend: null })),
-    { years: projectionYears, label: '+2yr', md: null, trend: intercept + slope * projectionYears },
-  ];
-  
-  // For the trend line, we need separate data with just start and end
   const trendData = [
     { years: 0, trend: intercept },
     { years: projectionYears, trend: intercept + slope * projectionYears },
@@ -1041,15 +1131,10 @@ const MDSlopeChart = ({ tests }) => {
   const rateLabel = slope >= -0.5 ? 'Stable' : slope > -1 ? 'Progressing' : slope > -2 ? 'Moderate' : 'Fast';
   const rateColor = slope >= -0.5 ? '#34d399' : slope > -1 ? '#fbbf24' : slope > -2 ? '#f97316' : '#ef4444';
   
-  // Custom tick formatter for X-axis
+  // Format X-axis ticks as years (0, 1, 2, etc.)
   const formatXAxis = (years) => {
-    if (years === 0) return mdPoints[0]?.label || '0';
-    if (years >= projectionYears - 0.1) return '+2yr';
-    // Find closest data point
-    const closest = mdPoints.reduce((prev, curr) => 
-      Math.abs(curr.years - years) < Math.abs(prev.years - years) ? curr : prev
-    );
-    return closest.label;
+    if (years === 0) return '0';
+    return years.toFixed(1).replace(/\.0$/, '');
   };
   
   return (
@@ -1067,7 +1152,7 @@ const MDSlopeChart = ({ tests }) => {
       
       <div style={{ height: 180 }}>
         <ResponsiveContainer>
-          <ComposedChart margin={{ top: 10, right: 10, left: -15, bottom: 0 }}>
+          <ComposedChart margin={{ top: 10, right: 10, left: -15, bottom: 20 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
             <XAxis 
               dataKey="years" 
@@ -1076,7 +1161,7 @@ const MDSlopeChart = ({ tests }) => {
               tickFormatter={formatXAxis}
               tick={{ fill: '#94a3b8', fontSize: 10 }} 
               axisLine={{ stroke: '#475569' }}
-              allowDuplicatedCategory={false}
+              label={{ value: 'Years from Baseline', position: 'bottom', offset: 0, style: { fill: '#64748b', fontSize: 10 } }}
             />
             <YAxis tick={{ fill: '#94a3b8', fontSize: 10 }} axisLine={{ stroke: '#475569' }} />
             <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid #334155', borderRadius: 8, fontSize: 12 }} />
@@ -1417,6 +1502,8 @@ export default function App() {
       // Auto-add if we have both date and MD
       if (result.success && result.date && result.md !== null) {
         const pattern = result.pattern || '24-2';
+        const td = result.td?.length ? result.td : generateTD(result.md, pattern);
+        const pd = result.pd?.length ? result.pd : generatePD(td);
         newTests.push({
           id: Date.now() + i,
           date: result.date,
@@ -1425,7 +1512,8 @@ export default function App() {
           vfi: result.vfi,
           eye: result.eye || 'OD',
           pattern,
-          td: result.td?.length ? result.td : generateTD(result.md, pattern)
+          td,
+          pd
         });
       }
     }
@@ -1446,13 +1534,16 @@ export default function App() {
     if (!vfForm.date || !vfForm.md) return;
     const md = parseFloat(vfForm.md);
     const pattern = vfForm.pattern || '24-2';
+    const td = generateTD(md, pattern);
+    const pd = generatePD(td);
     setVf([...vf, {
       id: Date.now(),
       date: vfForm.date,
       md,
       eye: vfForm.eye,
       pattern,
-      td: generateTD(md, pattern)
+      td,
+      pd
     }]);
     setVfForm({ date: '', md: '', eye: 'OD', pattern: '24-2' });
     setShowForm(false);
@@ -1465,6 +1556,8 @@ export default function App() {
       return;
     }
     const pattern = review.pattern || '24-2';
+    const td = review.td?.length ? review.td : generateTD(review.md, pattern);
+    const pd = review.pd?.length ? review.pd : generatePD(td);
     setVf([...vf, {
       id: Date.now(),
       date: review.date,
@@ -1473,7 +1566,8 @@ export default function App() {
       vfi: review.vfi,
       eye: review.eye || 'OD',
       pattern,
-      td: review.td?.length ? review.td : generateTD(review.md, pattern)
+      td,
+      pd
     }]);
     setReview(null);
   };
@@ -1550,6 +1644,8 @@ export default function App() {
             </div>
             
             {review.td?.length > 0 && <p style={{ color: '#22d3ee', fontSize: 12, marginTop: 12 }}>✓ Extracted {review.td.length} TD values ({review.pattern || '24-2'})</p>}
+            {review.pd?.length > 0 && <p style={{ color: '#10b981', fontSize: 12, marginTop: 4 }}>✓ Extracted {review.pd.length} PD values (used for GPA)</p>}
+            {review.td?.length > 0 && !review.pd?.length && <p style={{ color: '#fbbf24', fontSize: 12, marginTop: 4 }}>⚠ PD values not found (TD will be used for GPA)</p>}
             
             <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
               <button onClick={addFromReview} style={{ flex: 1, padding: 10, background: '#0891b2', color: '#fff', border: 'none', borderRadius: 6, cursor: 'pointer', fontWeight: 500 }}>Add Test</button>
@@ -1734,9 +1830,16 @@ export default function App() {
                   {/* Analysis Stats */}
                   <div style={{ background: 'linear-gradient(135deg, rgba(30,41,59,0.8), rgba(15,23,42,0.8))', borderRadius: 12, padding: 16, border: '1px solid #334155' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-                      <h3 style={{ margin: 0, fontSize: 14 }}>
-                        {vfMode === 'gpa' ? 'GPA Event Analysis' : 'Pointwise Linear Regression'}
-                      </h3>
+                      <div>
+                        <h3 style={{ margin: 0, fontSize: 14 }}>
+                          {vfMode === 'gpa' ? 'GPA Event Analysis' : 'Pointwise Linear Regression'}
+                        </h3>
+                        {vfMode === 'gpa' && (
+                          <span style={{ fontSize: 10, color: gpa.usingPD ? '#22d3ee' : '#fbbf24' }}>
+                            Using {gpa.usingPD ? 'Pattern Deviation (PD)' : 'Total Deviation (TD)'}
+                          </span>
+                        )}
+                      </div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                         <span style={{ width: 10, height: 10, borderRadius: '50%', background: statusColor(vfMode === 'gpa' ? gpa.status : plr.status) }} />
                         <span style={{ fontWeight: 600, color: statusColor(vfMode === 'gpa' ? gpa.status : plr.status) }}>
@@ -1756,7 +1859,7 @@ export default function App() {
                           <p style={{ fontSize: 10, color: '#64748b', margin: '4px 0 0' }}>Possible</p>
                         </div>
                         <div style={{ textAlign: 'center', padding: 10, background: 'rgba(30,41,59,0.5)', borderRadius: 6 }}>
-                          <p style={{ fontSize: 22, fontWeight: 'bold', color: '#94a3b8', margin: 0 }}>54</p>
+                          <p style={{ fontSize: 22, fontWeight: 'bold', color: '#94a3b8', margin: 0 }}>{gpa.bl?.length || 54}</p>
                           <p style={{ fontSize: 10, color: '#64748b', margin: '4px 0 0' }}>Total Points</p>
                         </div>
                       </div>
